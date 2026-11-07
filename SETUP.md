@@ -32,19 +32,26 @@ mix local.rebar --force
 
 ## 2. プラットフォームの依存関係とDB
 
-```sh
-cd platform_ex
-mix setup
-```
-
 `mix setup` は依存関係の取得、EctoのDB準備、アセット用ツールの取得とビルドを行います。
 開発用DBの既定パスは `platform_ex/storage/manga_platform.db` です。
 必要なら起動前に `MANGA_DB_PATH` で別のDBファイルを指定できます。
 
 **注意:** プラットフォームの既存ユーザー等のテーブルはPython版との互換用で、
 Elixir側のマイグレーションは追加テーブル（`jobs`）だけを作成します。
-空のSQLiteファイルだけではアプリを完全には利用できません。既存の互換DBを用意し、
-DBファイルを上書き・削除しないでください。`storage/` やDBをGitへ登録する必要もありません。
+初めて使う場合はPython版を一度起動して作成した `storage/manga_platform.db` を用意し、
+`mix setup` を実行する前に `platform_ex/storage/manga_platform.db` へ置いてください。
+`mix setup` が `jobs` テーブルのマイグレーションも実行します。
+
+すでに `mix setup` を空のDBに対して実行してしまった場合は、プラットフォームを停止し、
+生成された空のDBを互換DBに置き換えてから `platform_ex/` で `mix ecto.migrate` を
+一度実行してください。データの入ったDBを上書き・削除しないでください。
+空のSQLiteファイルだけではアプリを完全には利用できません。`storage/` やDBをGitへ
+登録する必要もありません。
+
+```sh
+cd platform_ex
+mix setup
+```
 
 ## 3. 内部トークンを設定してプラットフォームを起動
 
@@ -106,10 +113,23 @@ JWT署名鍵とクライアントキー用の秘密値は、明示設定がな�
 プラットフォームの開発起動では `SECRET_KEY_BASE` は不要です。
 本番モードでは別途本番用の秘密値などが必要で、この手順の対象外です。
 
-## 補足: 依存取得で失敗する環境
+## 補足: 検証VM固有の依存取得・コンパイル回避策
 
-最初の検証環境では `mix local.hex` の自己ダウンロードが権限エラーになったため、
-Hexアーカイブを手動配置し、Rebar3も手動で配置しました。また、Hexの依存取得が
-一時的なTLS切断やタイムアウトになることがありました。その場合は接続を確認して
-再試行してください。これはそのVM固有の回避策であり、通常の環境では上記の
-`mix local.hex` / `mix local.rebar` を使います。
+最初の検証VMでは `mix local.hex` の自己ダウンロードが権限エラーになったため、
+Hexアーカイブを手動配置し、Rebar3も手動で配置しました。Hexの依存取得が一時的な
+TLS切断やタイムアウトになることもあり、その場合は接続を確認して再試行してください。
+
+さらに、このVMではPhoenixのコンパイル時に `File.cp!` が `not owner` エラーで失敗します。
+新規cloneで同じエラーが出る場合に限り、まず `mix deps.get` を実行して依存を取得し、
+`platform_ex/deps/phoenix/mix.exs` の `copy_core_components` 内にある
+`File.cp!(source, destination)` を次のように変更してから `mix setup` を再実行します。
+
+```elixir
+unless File.exists?(destination) do
+  File.cp!(source, destination)
+end
+```
+
+依存を取り直すとこの変更は失われるため、その場合は再適用してください。これらは
+検証VM固有の回避策です。通常の環境では上記の `mix local.hex` / `mix local.rebar` を使い、
+Phoenixの依存ファイルは変更しないでください。
