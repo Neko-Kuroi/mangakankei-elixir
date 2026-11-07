@@ -132,12 +132,43 @@ defmodule YomimaEx.Platform do
     with %URI{} = u <- URI.parse(url),
          %URI{} = b <- URI.parse(base_url()) do
       u.userinfo in [nil, ""] and
-        u.scheme == b.scheme and u.host == b.host and
+        authority_well_formed?(u) and
+        u.scheme == b.scheme and String.downcase(u.host || "") == String.downcase(b.host || "") and
         (u.port || default_port(u.scheme)) == (b.port || default_port(b.scheme))
     else
       _ -> false
     end
   end
+
+  # authority が「ホスト」か「ホスト:数字のポート」だけであること。
+  # URI.parse は localhost:8000.evil.example のような壊れたポートを黙って
+  # 受け入れる版があるので、ここで形を確かめる（Python 版は urlsplit の
+  # .port が ValueError になって不一致になる）。
+  defp authority_well_formed?(%URI{authority: auth, host: host})
+       when is_binary(auth) and is_binary(host) do
+    a = String.downcase(auth)
+    h = String.downcase(host)
+    h = if String.contains?(h, ":"), do: "[" <> h <> "]", else: h
+    a == h or Regex.match?(~r/^#{Regex.escape(h)}:\d+$/, a)
+  end
+
+  defp authority_well_formed?(_), do: false
+
+  @thumb_media_types ~w(image/jpeg image/png image/webp image/gif)
+
+  @doc """
+  プラットフォームのサムネイル応答の Content-Type を、返してよいものだけ通す。
+  ヘッダ値のリスト（Req.Response.get_header の戻り値）か文字列を受け取り、
+  パラメータ（; charset=...）を落とした小文字の画像型を返す。それ以外は nil。
+  """
+  def image_media_type([value | _]), do: image_media_type(value)
+
+  def image_media_type(value) when is_binary(value) do
+    type = value |> String.split(";") |> hd() |> String.trim() |> String.downcase()
+    if type in @thumb_media_types, do: type
+  end
+
+  def image_media_type(_), do: nil
 
   defp default_port("http"), do: 80
   defp default_port("https"), do: 443

@@ -797,6 +797,12 @@ defmodule YomimaEx.Router do
     end
   end
 
+  # サムネイル応答に付けるヘッダ（返してよい Content-Type は Platform.image_media_type/1）
+  @thumb_headers [
+    {"cache-control", "private, max-age=86400"},
+    {"x-content-type-options", "nosniff"}
+  ]
+
   get "/thumbnail" do
     url = conn.params["url"] || ""
     index = conn.params["index"] || "0"
@@ -823,7 +829,7 @@ defmodule YomimaEx.Router do
       {body, content_type} ->
         conn
         |> put_resp_content_type(content_type)
-        |> put_resp_header("cache-control", "private, max-age=86400")
+        |> put_thumb_headers(@thumb_headers)
         |> send_resp(200, body)
 
       nil ->
@@ -831,32 +837,41 @@ defmodule YomimaEx.Router do
     end
   end
 
+  # 組み立てた thumb URL は、利用者が渡した url の文字列から作る。外部ホストの
+  # url でも宛先ポリシーは通るので、プラットフォームのオリジンのときだけ
+  # 取りに行く（内部トークンと読者トークンを外部へ送らない）。外部の作品は
+  # nil を返し、ダウンロード済みの中身から作るフォールバックに回る。
   defp proxy_thumbnail(url, index, session) do
-    case build_thumb_url(url, index) do
-      nil ->
-        nil
+    with thumb_url when is_binary(thumb_url) <- build_thumb_url(url, index),
+         true <- Platform.platform_origin?(thumb_url) do
+      headers =
+        Platform.internal_headers()
+        |> add_header(session.auth_token && String.contains?(thumb_url, "/api/public/thumb/"),
+          {"authorization", "Bearer #{session.auth_token}"})
+        |> add_header(session.age_verified && String.contains?(thumb_url, "/api/public/thumb/"),
+          {"x-age-verified", "1"})
 
-      thumb_url ->
-        headers =
-          Platform.internal_headers()
-          |> add_header(session.auth_token && String.contains?(thumb_url, "/api/public/thumb/"),
-            {"authorization", "Bearer #{session.auth_token}"})
-          |> add_header(session.age_verified && String.contains?(thumb_url, "/api/public/thumb/"),
-            {"x-age-verified", "1"})
+      # redirect: false … 宛先ポリシーを通っていない先へ辿らせない
+      # decode_body: false … 本文はバイト列のまま受け取る
+      case Req.new()
+           |> Req.get(
+             url: thumb_url,
+             headers: headers,
+             receive_timeout: 5_000,
+             redirect: false,
+             decode_body: false
+           ) do
+        {:ok, %{status: 200, body: body} = resp} when is_binary(body) ->
+          case Platform.image_media_type(Req.Response.get_header(resp, "content-type")) do
+            nil -> nil
+            content_type -> {body, content_type}
+          end
 
-        case Req.new() |> Req.get(url: thumb_url, headers: headers, receive_timeout: 5_000) do
-          {:ok, %{status: 200, body: body, headers: resp_headers}} ->
-            content_type =
-              case resp_headers["content-type"] do
-                [v | _] -> v
-                _ -> "image/jpeg"
-              end
-
-            {body, content_type}
-
-          _ ->
-            nil
-        end
+        _ ->
+          nil
+      end
+    else
+      _ -> nil
     end
   end
 
@@ -899,11 +914,15 @@ defmodule YomimaEx.Router do
 
                 conn
                 |> put_resp_content_type(content_type)
-                |> put_resp_header("cache-control", "private, max-age=86400")
+                |> put_thumb_headers(@thumb_headers)
                 |> send_resp(200, data)
             end
         end
     end
+  end
+
+  defp put_thumb_headers(conn, headers) do
+    Enum.reduce(headers, conn, fn {k, v}, c -> put_resp_header(c, k, v) end)
   end
 
   defp add_header(headers, flag, header) do

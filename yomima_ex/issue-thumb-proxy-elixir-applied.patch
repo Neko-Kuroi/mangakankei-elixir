@@ -1,0 +1,280 @@
+--- a/yomima_ex/lib/yomima_ex/platform.ex
++++ b/yomima_ex/lib/yomima_ex/platform.ex
+@@ -132,13 +132,44 @@
+     with %URI{} = u <- URI.parse(url),
+          %URI{} = b <- URI.parse(base_url()) do
+       u.userinfo in [nil, ""] and
+-        u.scheme == b.scheme and u.host == b.host and
++        authority_well_formed?(u) and
++        u.scheme == b.scheme and String.downcase(u.host || "") == String.downcase(b.host || "") and
+         (u.port || default_port(u.scheme)) == (b.port || default_port(b.scheme))
+     else
+       _ -> false
+     end
+   end
+ 
++  # authority が「ホスト」か「ホスト:数字のポート」だけであること。
++  # URI.parse は localhost:8000.evil.example のような壊れたポートを黙って
++  # 受け入れる版があるので、ここで形を確かめる（Python 版は urlsplit の
++  # .port が ValueError になって不一致になる）。
++  defp authority_well_formed?(%URI{authority: auth, host: host})
++       when is_binary(auth) and is_binary(host) do
++    a = String.downcase(auth)
++    h = String.downcase(host)
++    h = if String.contains?(h, ":"), do: "[" <> h <> "]", else: h
++    a == h or Regex.match?(~r/^#{Regex.escape(h)}:\d+$/, a)
++  end
++
++  defp authority_well_formed?(_), do: false
++
++  @thumb_media_types ~w(image/jpeg image/png image/webp image/gif)
++
++  @doc """
++  プラットフォームのサムネイル応答の Content-Type を、返してよいものだけ通す。
++  ヘッダ値のリスト（Req.Response.get_header の戻り値）か文字列を受け取り、
++  パラメータ（; charset=...）を落とした小文字の画像型を返す。それ以外は nil。
++  """
++  def image_media_type([value | _]), do: image_media_type(value)
++
++  def image_media_type(value) when is_binary(value) do
++    type = value |> String.split(";") |> hd() |> String.trim() |> String.downcase()
++    if type in @thumb_media_types, do: type
++  end
++
++  def image_media_type(_), do: nil
++
+   defp default_port("http"), do: 80
+   defp default_port("https"), do: 443
+   defp default_port(_), do: nil
+--- a/yomima_ex/lib/yomima_ex/router.ex
++++ b/yomima_ex/lib/yomima_ex/router.ex
+@@ -797,6 +797,12 @@
+     end
+   end
+ 
++  # サムネイル応答に付けるヘッダ（返してよい Content-Type は Platform.image_media_type/1）
++  @thumb_headers [
++    {"cache-control", "private, max-age=86400"},
++    {"x-content-type-options", "nosniff"}
++  ]
++
+   get "/thumbnail" do
+     url = conn.params["url"] || ""
+     index = conn.params["index"] || "0"
+@@ -823,7 +829,7 @@
+       {body, content_type} ->
+         conn
+         |> put_resp_content_type(content_type)
+-        |> put_resp_header("cache-control", "private, max-age=86400")
++        |> put_thumb_headers(@thumb_headers)
+         |> send_resp(200, body)
+ 
+       nil ->
+@@ -831,32 +837,41 @@
+     end
+   end
+ 
++  # 組み立てた thumb URL は、利用者が渡した url の文字列から作る。外部ホストの
++  # url でも宛先ポリシーは通るので、プラットフォームのオリジンのときだけ
++  # 取りに行く（内部トークンと読者トークンを外部へ送らない）。外部の作品は
++  # nil を返し、ダウンロード済みの中身から作るフォールバックに回る。
+   defp proxy_thumbnail(url, index, session) do
+-    case build_thumb_url(url, index) do
+-      nil ->
+-        nil
+-
+-      thumb_url ->
+-        headers =
+-          Platform.internal_headers()
+-          |> add_header(session.auth_token && String.contains?(thumb_url, "/api/public/thumb/"),
+-            {"authorization", "Bearer #{session.auth_token}"})
+-          |> add_header(session.age_verified && String.contains?(thumb_url, "/api/public/thumb/"),
+-            {"x-age-verified", "1"})
+-
+-        case Req.new() |> Req.get(url: thumb_url, headers: headers, receive_timeout: 5_000) do
+-          {:ok, %{status: 200, body: body, headers: resp_headers}} ->
+-            content_type =
+-              case resp_headers["content-type"] do
+-                [v | _] -> v
+-                _ -> "image/jpeg"
+-              end
+-
+-            {body, content_type}
++    with thumb_url when is_binary(thumb_url) <- build_thumb_url(url, index),
++         true <- Platform.platform_origin?(thumb_url) do
++      headers =
++        Platform.internal_headers()
++        |> add_header(session.auth_token && String.contains?(thumb_url, "/api/public/thumb/"),
++          {"authorization", "Bearer #{session.auth_token}"})
++        |> add_header(session.age_verified && String.contains?(thumb_url, "/api/public/thumb/"),
++          {"x-age-verified", "1"})
++
++      # redirect: false … 宛先ポリシーを通っていない先へ辿らせない
++      # decode_body: false … 本文はバイト列のまま受け取る
++      case Req.new()
++           |> Req.get(
++             url: thumb_url,
++             headers: headers,
++             receive_timeout: 5_000,
++             redirect: false,
++             decode_body: false
++           ) do
++        {:ok, %{status: 200, body: body} = resp} when is_binary(body) ->
++          case Platform.image_media_type(Req.Response.get_header(resp, "content-type")) do
++            nil -> nil
++            content_type -> {body, content_type}
++          end
+ 
+-          _ ->
+-            nil
+-        end
++        _ ->
++          nil
++      end
++    else
++      _ -> nil
+     end
+   end
+ 
+@@ -899,13 +914,17 @@
+ 
+                 conn
+                 |> put_resp_content_type(content_type)
+-                |> put_resp_header("cache-control", "private, max-age=86400")
++                |> put_thumb_headers(@thumb_headers)
+                 |> send_resp(200, data)
+             end
+         end
+     end
+   end
+ 
++  defp put_thumb_headers(conn, headers) do
++    Enum.reduce(headers, conn, fn {k, v}, c -> put_resp_header(c, k, v) end)
++  end
++
+   defp add_header(headers, flag, header) do
+     if flag, do: headers ++ [header], else: headers
+   end
+--- /dev/null
++++ b/yomima_ex/test/thumb_proxy_test.exs
+@@ -0,0 +1,59 @@
++defmodule YomimaEx.ThumbProxyTest do
++  # /thumbnail のプロキシ: 外部ホストへ内部トークンを送らない・HTML を素通ししない、
++  # の判断部分（Platform.platform_origin?/1 と Platform.image_media_type/1）の単体テスト。
++  use ExUnit.Case, async: false
++
++  alias YomimaEx.Platform
++
++  setup do
++    old = System.get_env("PLATFORM_BASE_URL")
++    System.put_env("PLATFORM_BASE_URL", "http://localhost:8000")
++
++    on_exit(fn ->
++      if old, do: System.put_env("PLATFORM_BASE_URL", old), else: System.delete_env("PLATFORM_BASE_URL")
++    end)
++  end
++
++  describe "image_media_type/1" do
++    test "画像の型だけ通し、パラメータと大文字小文字は正規化する" do
++      assert Platform.image_media_type(["image/png"]) == "image/png"
++      assert Platform.image_media_type(["image/jpeg"]) == "image/jpeg"
++      assert Platform.image_media_type(["image/webp"]) == "image/webp"
++      assert Platform.image_media_type(["image/gif"]) == "image/gif"
++      assert Platform.image_media_type(["image/png; foo=bar"]) == "image/png"
++      assert Platform.image_media_type(["IMAGE/JPEG"]) == "image/jpeg"
++      assert Platform.image_media_type("image/png") == "image/png"
++    end
++
++    test "HTML・SVG・不明な型・欠落は nil" do
++      assert Platform.image_media_type(["text/html"]) == nil
++      assert Platform.image_media_type(["text/html; charset=utf-8"]) == nil
++      assert Platform.image_media_type(["image/svg+xml"]) == nil
++      assert Platform.image_media_type(["application/octet-stream"]) == nil
++      assert Platform.image_media_type([]) == nil
++      assert Platform.image_media_type(nil) == nil
++    end
++  end
++
++  describe "platform_origin?/1（thumb URL の宛先判定）" do
++    test "プラットフォームのオリジンは true" do
++      assert Platform.platform_origin?("http://localhost:8000/api/public/thumb/1/2/3/0")
++      assert Platform.platform_origin?("HTTP://LOCALHOST:8000/api/public/thumb/1/2/3/0")
++    end
++
++    test "既定ポートの省略は同じオリジンとして扱う" do
++      System.put_env("PLATFORM_BASE_URL", "https://plat.example.com")
++      assert Platform.platform_origin?("https://plat.example.com/api/public/thumb/1/2/3/0")
++      assert Platform.platform_origin?("https://plat.example.com:443/api/public/thumb/1/2/3/0")
++      refute Platform.platform_origin?("https://plat.example.com:444/api/public/thumb/1/2/3/0")
++    end
++
++    test "外部ホスト・まぎらわしいホスト・userinfo 付きは false" do
++      refute Platform.platform_origin?("http://evil.example/api/public/thumb/1/2/3/0")
++      refute Platform.platform_origin?("http://localhost:8000.evil.example/api/public/thumb/1/2/3/0")
++      refute Platform.platform_origin?("http://localhost:8000@evil.example/api/public/thumb/1/2/3/0")
++      refute Platform.platform_origin?("https://localhost:8000/api/public/thumb/1/2/3/0")
++      refute Platform.platform_origin?("http://localhost:8000abc/api/public/thumb/1/2/3/0")
++    end
++  end
++end
+--- /dev/null
++++ b/yomima_ex/verify_thumb.sh
+@@ -0,0 +1,58 @@
++#!/bin/bash
++# /thumbnail が外部ホストへ内部トークンを送らず、HTML も素通ししないことの実地検証。
++# 事前に閲覧側(:8001)を次の環境変数つきで起動しておくこと:
++#   PLATFORM_BASE_URL=http://127.0.0.1:8000   （外部ホスト役の :9100 とは別にする）
++#   MANGA_INTERNAL_TOKEN=SECRET-INTERNAL-TOKEN
++#   MANGA_URL_ALLOW_HOSTS=127.0.0.1           （:9100 を「許可された外部ホスト」にするため）
++# 外部ホスト役の小さなサーバー(:9100)はこのスクリプトが起動・停止する。
++V=http://127.0.0.1:8001
++EXT=http://127.0.0.1:9100
++LOG=$(mktemp)
++PASS=0; FAIL=0
++check() { # name expected actual
++  if [ "$2" == "$3" ]; then echo "PASS: $1"; PASS=$((PASS+1));
++  else echo "FAIL: $1 (expected [$2] got [$3])"; FAIL=$((FAIL+1)); fi
++}
++
++python3 - "$LOG" <<'PY' &
++import sys
++from http.server import BaseHTTPRequestHandler, HTTPServer
++log = sys.argv[1]
++class H(BaseHTTPRequestHandler):
++    def do_GET(self):
++        with open(log, "a") as f:
++            f.write(f"{self.path} token={self.headers.get('x-internal-token')}\n")
++        body = b"<script>alert(1)</script>"
++        self.send_response(200)
++        self.send_header("Content-Type", "text/html")
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++    def log_message(self, *a): pass
++HTTPServer(("127.0.0.1", 9100), H).serve_forever()
++PY
++STUB=$!
++trap 'kill $STUB 2>/dev/null; rm -f "$LOG"' EXIT
++sleep 1
++
++URL="$EXT/api/public/cbz/1/2/3.cbz"
++TOKEN=$(curl -s --get --data-urlencode "url=$URL" "$V/session" \
++  | python3 -c "import json,sys; print(json.load(sys.stdin).get('session_token',''))")
++check "session for allowed external host" "yes" "$([ -n "$TOKEN" ] && echo yes || echo no)"
++
++HDR=$(mktemp)
++BODY=$(curl -s -D "$HDR" --get --data-urlencode "url=$URL" --data-urlencode "index=0" \
++  --data-urlencode "session_token=$TOKEN" "$V/thumbnail")
++CT=$(grep -i '^content-type:' "$HDR" | tr -d '\r' | sed 's/^[^:]*: *//' | cut -d';' -f1 | tr 'A-Z' 'a-z')
++NOSNIFF=$(grep -i '^x-content-type-options:' "$HDR" | tr -d '\r' | sed 's/^[^:]*: *//')
++rm -f "$HDR"
++
++check "external host received no thumb request" "0" "$(grep -c '^/api/public/thumb/' "$LOG")"
++check "internal token never sent to external host" "0" "$(grep -c 'token=SECRET' "$LOG")"
++check "HTML is not relayed (no <script> in body)" "0" "$(echo "$BODY" | grep -c '<script>')"
++check "response is not text/html" "no" "$([ "$CT" == "text/html" ] && echo yes || echo no)"
++# 画像を返した場合だけ nosniff を確認する（外部の作品は未ダウンロードなら 404 の JSON になる）
++case "$CT" in image/*) check "nosniff header on image response" "nosniff" "$NOSNIFF" ;; esac
++
++echo "PASS=$PASS FAIL=$FAIL"
++[ "$FAIL" -eq 0 ]
