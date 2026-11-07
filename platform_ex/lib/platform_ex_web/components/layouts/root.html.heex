@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="csrf-token" content={get_csrf_token()} />
+    <.live_title default="マンガプラットフォーム" phx-no-format>{assigns[:page_title]}</.live_title>
+    <link phx-track-static rel="stylesheet" href={~p"/assets/css/app.css"} />
+    <script defer phx-track-static type="text/javascript" src={~p"/assets/js/app.js"}>
+    </script>
+  </head>
+  <body class="bg-slate-100 text-slate-800 min-h-screen">
+    <nav class="bg-slate-800 px-5 py-3.5 flex items-center gap-4 flex-wrap">
+      <span class="text-white font-bold text-lg mr-2">📚 マンガプラットフォーム</span>
+      <a
+        href="/"
+        class="text-slate-300 text-sm px-2.5 py-1 rounded hover:bg-slate-700 hover:text-white"
+      >🔍 公開作品</a>
+      <a
+        href="/author"
+        class="text-slate-300 text-sm px-2.5 py-1 rounded hover:bg-slate-700 hover:text-white"
+      >📋 マイ作品</a>
+      <a
+        href="/author#upload"
+        class="text-slate-300 text-sm px-2.5 py-1 rounded hover:bg-slate-700 hover:text-white"
+      >📤 アップロード</a>
+      <%= if assigns[:current_user] && PlatformEx.Admin.admin?(assigns[:current_user].username) do %>
+        <a
+          href="/admin"
+          class="text-slate-300 text-sm px-2.5 py-1 rounded hover:bg-slate-700 hover:text-white"
+        >🛡 管理</a>
+      <% end %>
+      <span class="ml-auto text-sky-400 text-sm">
+        <%= if assigns[:current_user] do %>
+          👤 {assigns[:current_user].username}
+          <form action="/session/logout" method="post" class="inline">
+            <input type="hidden" name="_csrf_token" value={get_csrf_token()} />
+            <button type="submit" class="text-slate-300 underline ml-2">ログアウト</button>
+          </form>
+        <% else %>
+          <a
+            href="/login"
+            class="text-slate-300 px-2.5 py-1 rounded hover:bg-slate-700 hover:text-white"
+          >🔐 アカウント</a>
+        <% end %>
+      </span>
+    </nav>
+    <div class="bg-slate-700 px-5 py-2 flex items-center gap-2 flex-wrap text-sm">
+      <span class="text-slate-200">👁 ビューワーURL:</span>
+      <form action="/viewer-url" method="post" class="flex items-center gap-2 flex-1 min-w-64">
+        <input type="hidden" name="_csrf_token" value={get_csrf_token()} />
+        <input
+          type="hidden"
+          name="return_to"
+          value={assigns[:current_path] || "/"}
+        />
+        <input
+          type="url"
+          name="viewer_url"
+          value={assigns[:viewer_url] || ""}
+          placeholder="https://xxxx.trycloudflare.com"
+          class="flex-1 px-2 py-1 rounded text-sm"
+        />
+        <button type="submit" class="text-slate-100 border border-slate-500 rounded px-3 py-1">
+          設定
+        </button>
+      </form>
+      <%= if (assigns[:viewer_url] || "") != "" do %>
+        <span class="text-sky-400">✅ 設定済み</span>
+      <% end %>
+    </div>
+    {@inner_content}
+  </body>
+</html>
